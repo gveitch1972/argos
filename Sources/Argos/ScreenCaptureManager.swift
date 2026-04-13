@@ -2,9 +2,8 @@ import ScreenCaptureKit
 import AVFoundation
 import AppKit
 
-/// Captures the main Mac display and delivers frames to an AVSampleBufferDisplayLayer.
-/// The overlay window uses this layer as its content — panning it with head movement
-/// gives the "display pinned in space" effect.
+/// Captures a display (real or virtual) and delivers frames to an
+/// AVSampleBufferDisplayLayer for rendering in the overlay.
 @MainActor
 class ScreenCaptureManager: NSObject {
 
@@ -16,58 +15,79 @@ class ScreenCaptureManager: NSObject {
 
     // ── Start / stop ──────────────────────────────────────────────────────────
 
-    func start() async {
-        guard !isRunning else { return }
+    /// Start capturing the given display.
+    /// - Parameter displayID: CGDirectDisplayID to capture.
+    ///   Pass `kCGNullDirectDisplay` (0) to capture the main Mac display.
+    func start(displayID targetID: CGDirectDisplayID = 0) async {
+        NSLog("[capture] start() called, targetID=%u, isRunning=%d", targetID, isRunning ? 1 : 0)
+        guard !isRunning else { NSLog("[capture] already running, skipping"); return }
 
-        // Request permission — prompts the user once, then remembered
         guard await requestPermission() else {
-            print("[capture] screen recording permission denied")
+            NSLog("[capture] screen recording permission denied")
             return
         }
 
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            NSLog("[capture] found %d displays", content.displays.count)
 
-            // Capture the main display (not the glasses display)
-            guard let display = content.displays.first(where: { CGDisplayIsMain($0.displayID) != 0 })
-                              ?? content.displays.first else {
-                print("[capture] no display found")
+            // Find the requested display; fall back to main display.
+            let display: SCDisplay
+            if targetID != 0,
+               let found = content.displays.first(where: { $0.displayID == targetID }) {
+                display = found
+                NSLog("[capture] targeting virtual display %u", targetID)
+            } else if let main = content.displays.first(where: { CGDisplayIsMain($0.displayID) != 0 }) {
+                display = main
+                if targetID != 0 {
+                    NSLog("[capture] virtual display %u not visible to SCKit yet, using main", targetID)
+                } else {
+                    NSLog("[capture] targeting main display %u", main.displayID)
+                }
+            } else if let first = content.displays.first {
+                display = first
+                NSLog("[capture] using first available display %u", first.displayID)
+            } else {
+                NSLog("[capture] no display found — giving up")
                 return
             }
 
             let config = SCStreamConfiguration()
-            config.width  = display.width  * 2   // retina
+            config.width  = display.width  * 2   // retina / HiDPI
             config.height = display.height * 2
             config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
             config.capturesAudio = false
 
-            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+            // Exclude Argos itself from the capture — prevents recursive feedback loop
+            let argosApp = content.applications.first(where: { $0.bundleIdentifier == "com.grahamveitch.argos" })
+            let excludedApps = argosApp.map { [$0] } ?? []
+            let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
             let s = SCStream(filter: filter, configuration: config, delegate: self)
             try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: .main)
             try await s.startCapture()
 
             stream = s
             isRunning = true
-            print("[capture] started — capturing \(display.width)×\(display.height)")
+            NSLog("[capture] started — %dx%d", display.width, display.height)
         } catch {
-            print("[capture] failed to start: \(error)")
+            NSLog("[capture] failed to start: %@", error.localizedDescription)
         }
     }
 
     func stop() {
         guard isRunning else { return }
-        Task {
-            try? await stream?.stopCapture()
-            stream = nil
-            isRunning = false
-        }
+        isRunning = false
+        displayLayer.flushAndRemoveImage()  // clear last frame immediately
+        let s = stream
+        stream = nil
+        Task { try? await s?.stopCapture() }
+        NSLog("[capture] stopped")
     }
 
     // ── Private ───────────────────────────────────────────────────────────────
 
     private func requestPermission() async -> Bool {
         do {
-            // This call triggers the permission prompt if not yet granted
             _ = try await SCShareableContent.current
             return true
         } catch {
@@ -91,7 +111,7 @@ extension ScreenCaptureManager: SCStreamOutput {
 
 extension ScreenCaptureManager: SCStreamDelegate {
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
-        print("[capture] stream stopped: \(error)")
+        NSLog("[capture] stream stopped: %@", error.localizedDescription)
         DispatchQueue.main.async { self.isRunning = false }
     }
 }

@@ -1,4 +1,4 @@
-.PHONY: all build run clean test
+.PHONY: all build app sign run clean test
 
 RUST_LIB     = driver/target/release/libargos_driver.a
 SWIFT_FLAGS  = -Xlinker -L$(PWD)/driver/target/release \
@@ -6,19 +6,37 @@ SWIFT_FLAGS  = -Xlinker -L$(PWD)/driver/target/release \
                -Xlinker -framework -Xlinker IOKit \
                -Xlinker -framework -Xlinker CoreFoundation
 
+SIGN_ID      = "Apple Development: apple@grahamveitch.com (6TQVS3337G)"
+ENTITLEMENTS = $(PWD)/Argos.entitlements
+BINARY       = .build/debug/Argos
+APP_BUNDLE   = Argos.app
+
 all: build
 
-## Build Rust driver then Swift app
+## Build Rust driver + Swift binary + .app bundle + sign
 build: $(RUST_LIB)
 	swift build $(SWIFT_FLAGS)
+	$(MAKE) app
 
-## Build release binary
-release: $(RUST_LIB)
-	swift build -c release $(SWIFT_FLAGS)
+## Assemble Argos.app bundle and sign it
+app:
+	mkdir -p $(APP_BUNDLE)/Contents/MacOS
+	cp $(BINARY) $(APP_BUNDLE)/Contents/MacOS/Argos
+	cp Sources/Argos/Info.plist $(APP_BUNDLE)/Contents/Info.plist
+	codesign --force --sign $(SIGN_ID) \
+	         --entitlements $(ENTITLEMENTS) \
+	         $(APP_BUNDLE)
+	@echo "[build] Argos.app ready"
 
-## Build and run
+## Sign the raw binary only (for quick iteration)
+sign:
+	codesign --force --sign $(SIGN_ID) \
+	         --entitlements $(ENTITLEMENTS) \
+	         $(BINARY)
+
+## Build and open the .app
 run: build
-	.build/debug/Argos
+	open $(APP_BUNDLE)
 
 ## Build Rust driver only
 $(RUST_LIB):
@@ -30,4 +48,5 @@ test:
 
 clean:
 	swift package clean
+	rm -rf $(APP_BUNDLE)
 	cd driver && ~/.cargo/bin/cargo clean

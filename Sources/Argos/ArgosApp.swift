@@ -15,13 +15,15 @@ struct ArgosApp: App {
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
 
-    let glassesManager = GlassesManager()
-    let captureManager = ScreenCaptureManager()
+    let glassesManager    = GlassesManager()
+    let captureManager    = ScreenCaptureManager()
+    let virtualDisplay    = VirtualDisplayManager()
 
     private var statusItem: NSStatusItem?
     private var overlayWindow: OverlayWindow?
-    private var overlayShowing = false
-    private var captureActive = false
+    private var overlayShowing  = false
+    private var captureActive   = false
+    private var virtualActive   = false   // virtual display is up
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -47,8 +49,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
-        // Cmd+Q only — global monitor just observes, cannot consume,
-        // but terminate() works fine as a side effect.
+        // Cmd+Q — global monitor just observes; terminate() is the side-effect we want
         NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
             if event.modifierFlags.contains(.command),
                event.charactersIgnoringModifiers == "q" {
@@ -57,29 +58,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         glassesManager.start()
-        // Overlay and capture are both OFF at startup — open manually via menu
-        // so you can always see and interact with your Mac display first
+        // Everything else is opt-in via menu
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        virtualDisplay.destroy()
     }
 
     // ── Overlay ───────────────────────────────────────────────────────────────
 
     private func tryOpenOverlay() {
-        guard let screen = DisplayFinder.xrealScreen() ?? DisplayFinder.externalScreens().first else {
-            return
-        }
+        // Exclude the virtual display we created — it has no physical panel
+        let virtualID = virtualDisplay.displayID
+        let screen = DisplayFinder.xrealScreen()
+            ?? DisplayFinder.externalScreens().first(where: { screen in
+                guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+                else { return true }
+                return id != virtualID
+            })
+        guard let screen else { return }
         openOverlay(on: screen)
     }
 
     private func openOverlay(on screen: NSScreen) {
-        // Re-use existing window if screen hasn't changed — never close() it
         if let existing = overlayWindow, existing.screen == screen {
             existing.orderFrontRegardless()
+            if captureActive {
+                existing.attachCaptureLayer(captureManager.displayLayer)
+            }
             overlayShowing = true
             updateOverlayMenuItem()
             return
         }
 
-        // New screen — hide old window first (don't close)
         overlayWindow?.orderOut(nil)
 
         let window = OverlayWindow(screen: screen)
@@ -97,7 +108,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func closeOverlay() {
         overlayWindow?.orderOut(nil)
         overlayShowing = false
-        // Re-assert accessory policy — SCStream permission UI can flip it to .regular
         NSApp.setActivationPolicy(.accessory)
         updateOverlayMenuItem()
     }
@@ -119,7 +129,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         toggleItem.target = self
         menu.addItem(toggleItem)
 
-        let captureItem = NSMenuItem(title: "Start screen capture",
+        let virtualItem = NSMenuItem(title: "Create virtual display",
+                                     action: #selector(toggleVirtualDisplay),
+                                     keyEquivalent: "")
+        virtualItem.tag = 12
+        virtualItem.target = self
+        menu.addItem(virtualItem)
+
+        let captureItem = NSMenuItem(title: "Start capture → glasses",
                                      action: #selector(toggleCapture),
                                      keyEquivalent: "")
         captureItem.tag = 11
@@ -149,11 +166,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateOverlayMenuItem() {
-        statusItem?.menu?.item(withTag: 10)?.title = overlayShowing ? "Hide overlay (click top bar)" : "Show overlay on glasses"
+        let title: String
+        if overlayShowing {
+            title = captureActive ? "Hide overlay (capture keeps running)" : "Hide overlay"
+        } else {
+            title = captureActive ? "Show overlay (capture running)" : "Show overlay on glasses"
+        }
+        statusItem?.menu?.item(withTag: 10)?.title = title
     }
 
     private func updateCaptureMenuItem() {
-        statusItem?.menu?.item(withTag: 11)?.title = captureActive ? "Stop screen capture" : "Start screen capture"
+        statusItem?.menu?.item(withTag: 11)?.title =
+            captureActive ? "Stop capture" : "Start capture → glasses"
+    }
+
+    private func updateVirtualMenuItem() {
+        let base = virtualActive ? "Destroy virtual display" : "Create virtual display"
+        let info = virtualActive ? " (id=\(virtualDisplay.displayID ?? 0))" : ""
+        statusItem?.menu?.item(withTag: 12)?.title = base + info
     }
 
     private func updateMenuBarIcon(connected: Bool) {
@@ -167,15 +197,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if overlayShowing { closeOverlay() } else { tryOpenOverlay() }
     }
 
+    @objc func toggleVirtualDisplay() {
+        if virtualActive {
+            // Also stop capture if it was targeting the virtual display
+            if captureActive {
+                captureManager.stop()
+                captureActive = false
+                updateCaptureMenuItem()
+            }
+            virtualDisplay.destroy()
+            virtualActive = false
+        } else {
+            virtualActive = virtualDisplay.create()
+            if !virtualActive {
+                showEntitlementAlert()
+            }
+        }
+        updateVirtualMenuItem()
+    }
+
     @objc func toggleCapture() {
         if captureActive {
             captureManager.stop()
+            overlayWindow?.detachCaptureLayer()
             captureActive = false
-        } else {
-            captureActive = true
-            Task {
-                await captureManager.start()
-                overlayWindow?.attachCaptureLayer(captureManager.displayLayer)
+            updateCaptureMenuItem()
+            return
+        }
+
+        // Auto-open the overlay if it isn't showing — nothing to display capture into otherwise
+        if !overlayShowing { tryOpenOverlay() }
+
+        captureActive = true
+        let targetID = virtualDisplay.displayID ?? 0
+        Task {
+            await captureManager.start(displayID: targetID)
+            // Attach after start() so the layer is primed before hitting the window
+            if let win = overlayWindow {
+                win.attachCaptureLayer(captureManager.displayLayer)
             }
         }
         updateCaptureMenuItem()
@@ -193,9 +252,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if overlayShowing { tryOpenOverlay() }
     }
 
-    // Prevent app from quitting when last window closes
-    func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-    // Prevent app from hiding when it loses focus
+    private func showEntitlementAlert() {
+        let alert = NSAlert()
+        alert.messageText = "Virtual display unavailable"
+        alert.informativeText =
+            "CGVirtualDisplay requires the com.apple.developer.virtual-display entitlement.\n\n" +
+            "Make sure the binary is code-signed with that entitlement (run `make sign` or `make build`)."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ app: NSApplication, hasVisibleWindows: Bool) -> Bool { true }
 }

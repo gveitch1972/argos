@@ -3,16 +3,21 @@ import AVFoundation
 
 /// Full-screen borderless window on the Xreal display.
 ///
-/// Shows a live capture of the Mac desktop, panned opposite to head movement
-/// so the display feels pinned in space. The capture layer is slightly inset
-/// so head movement pans within the padding rather than hitting black instantly.
+/// Two modes:
+///   • Idle   — dark background, ARGOS placeholder, grid, crosshair, status bar
+///   • Capture — shows live Mac desktop scaled to contentScale; all chrome hidden
 class OverlayWindow: NSWindow {
 
-    private var panLayer = CALayer()
+    private var panLayer    = CALayer()
     private let statusLabel = CATextLayer()
-    private let crosshair = CAShapeLayer()
+    private var crosshairLayer: CAShapeLayer?
+    private var argosLabel: CATextLayer?
     private var captureLayer: AVSampleBufferDisplayLayer?
     private var screenSize: CGSize = .zero
+    private var hideBarView: HideBarView?
+
+    /// 1.0 = edge-to-edge; 0.75 = floating panel with dark border.
+    var contentScale: CGFloat = 0.75
 
     /// Called when user clicks the top hide-bar.
     var onHideRequested: (() -> Void)?
@@ -30,7 +35,7 @@ class OverlayWindow: NSWindow {
         self.isOpaque = false
         self.backgroundColor = .clear
         self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        self.ignoresMouseEvents = false  // we handle clicks in the hide-bar only
+        self.ignoresMouseEvents = false
         self.isMovable = false
 
         screenSize = screen.frame.size
@@ -39,23 +44,30 @@ class OverlayWindow: NSWindow {
 
     // ── Public ────────────────────────────────────────────────────────────────
 
-    /// Attach the live capture layer from ScreenCaptureManager.
+    /// Attach the live capture layer and switch to capture mode (hides chrome).
     func attachCaptureLayer(_ layer: AVSampleBufferDisplayLayer) {
         captureLayer?.removeFromSuperlayer()
 
-        // Scale capture (Mac retina) down to glasses display size
-        let w = screenSize.width
-        let h = screenSize.height
-        layer.frame = CGRect(x: 0, y: 0, width: w, height: h)
-        layer.videoGravity = .resizeAspectFill
+        let pw = panLayer.bounds.width
+        let ph = panLayer.bounds.height
+        let w  = screenSize.width  * contentScale
+        let h  = screenSize.height * contentScale
 
-        panLayer.insertSublayer(layer, at: 0) // behind grid + labels
+        layer.frame = CGRect(x: (pw - w) / 2, y: (ph - h) / 2, width: w, height: h)
+        layer.videoGravity = .resizeAspectFill
+        layer.cornerRadius = 12
+
+        panLayer.insertSublayer(layer, at: 0)
         captureLayer = layer
 
-        // Hide placeholder grid now we have real content
-        panLayer.sublayers?
-            .filter { $0 is CAShapeLayer }
-            .forEach { $0.opacity = 0 }
+        setCaptureChrome(visible: false)
+    }
+
+    /// Remove capture layer and revert to idle placeholder mode.
+    func detachCaptureLayer() {
+        captureLayer?.removeFromSuperlayer()
+        captureLayer = nil
+        setCaptureChrome(visible: true)
     }
 
     /// Shift content opposite to head rotation — makes display feel fixed in space.
@@ -70,6 +82,7 @@ class OverlayWindow: NSWindow {
         CATransaction.commit()
     }
 
+    /// Update the status text shown in idle mode.
     func setStatus(_ text: String) {
         DispatchQueue.main.async {
             CATransaction.begin()
@@ -81,6 +94,27 @@ class OverlayWindow: NSWindow {
 
     // ── Private ───────────────────────────────────────────────────────────────
 
+    /// Show or hide the idle-mode chrome (grid, label, crosshair, status, hide-bar text).
+    private func setCaptureChrome(visible: Bool) {
+        let opacity: Float = visible ? 1 : 0
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        // Placeholder elements in panLayer
+        panLayer.sublayers?
+            .filter { $0 is CAShapeLayer || $0 is CATextLayer }
+            .forEach { $0.opacity = opacity }
+
+        // Root-level elements
+        crosshairLayer?.opacity = opacity
+        statusLabel.opacity     = visible ? 0.9 : 0
+
+        CATransaction.commit()
+
+        // Hide-bar label — visible in both modes but text changes
+        hideBarView?.setLabelVisible(visible)
+    }
+
     private func setupLayers(bounds: NSRect) {
         let view = NSView(frame: bounds)
         view.wantsLayer = true
@@ -88,9 +122,9 @@ class OverlayWindow: NSWindow {
         contentView = view
         guard let root = view.layer else { return }
 
-        root.backgroundColor = CGColor(red: 0.05, green: 0.05, blue: 0.08, alpha: 1.0)
+        root.backgroundColor = CGColor(red: 0.03, green: 0.03, blue: 0.05, alpha: 1.0)
 
-        // Pan layer — 1.5× screen, centred. Extra space is the "panning room".
+        // Pan layer — 1.5× screen, centred
         let pw = bounds.width  * 1.5
         let ph = bounds.height * 1.5
         panLayer = CALayer()
@@ -99,20 +133,21 @@ class OverlayWindow: NSWindow {
         panLayer.backgroundColor = CGColor.clear
         root.addSublayer(panLayer)
 
-        // Placeholder grid — visible until screen capture starts
         addGrid(to: panLayer, width: pw, height: ph)
-        addLabel(to: panLayer, width: pw, height: ph)
+        let lbl = addLabel(to: panLayer, width: pw, height: ph)
+        argosLabel = lbl
 
-        // Fixed crosshair at screen centre
         let ch = makeCrosshair(centre: CGPoint(x: bounds.width / 2, y: bounds.height / 2))
+        crosshairLayer = ch
         root.addSublayer(ch)
 
-        // Clickable hide-bar — 28px strip across the full top edge
-        let hideBar = HideBarView(frame: CGRect(x: 0, y: bounds.height - 28, width: bounds.width, height: 28))
-        hideBar.onHide = { [weak self] in self?.onHideRequested?() }
-        view.addSubview(hideBar)
+        // Hide-bar — always present, always clickable
+        let bar = HideBarView(frame: CGRect(x: 0, y: bounds.height - 28, width: bounds.width, height: 28))
+        bar.onHide = { [weak self] in self?.onHideRequested?() }
+        view.addSubview(bar)
+        hideBarView = bar
 
-        // Status — fixed top-left (sits inside the hide-bar area)
+        // Status label (idle mode only)
         statusLabel.frame = CGRect(x: 16, y: bounds.height - 26, width: 700, height: 20)
         statusLabel.fontSize = 12
         statusLabel.foregroundColor = CGColor(red: 0.3, green: 1.0, blue: 0.3, alpha: 0.9)
@@ -126,9 +161,9 @@ class OverlayWindow: NSWindow {
         let path = CGMutablePath()
         let spacing: CGFloat = 40
         var x: CGFloat = 0
-        while x <= width  { path.move(to: CGPoint(x: x, y: 0));     path.addLine(to: CGPoint(x: x, y: height)); x += spacing }
+        while x <= width  { path.move(to: CGPoint(x: x, y: 0)); path.addLine(to: CGPoint(x: x, y: height)); x += spacing }
         var y: CGFloat = 0
-        while y <= height { path.move(to: CGPoint(x: 0, y: y));     path.addLine(to: CGPoint(x: width, y: y));  y += spacing }
+        while y <= height { path.move(to: CGPoint(x: 0, y: y)); path.addLine(to: CGPoint(x: width, y: y));  y += spacing }
         grid.path = path
         grid.strokeColor = CGColor(red: 0.15, green: 0.25, blue: 0.4, alpha: 0.6)
         grid.lineWidth = 0.5
@@ -136,7 +171,8 @@ class OverlayWindow: NSWindow {
         layer.addSublayer(grid)
     }
 
-    private func addLabel(to layer: CALayer, width: CGFloat, height: CGFloat) {
+    @discardableResult
+    private func addLabel(to layer: CALayer, width: CGFloat, height: CGFloat) -> CATextLayer {
         let label = CATextLayer()
         label.string = "ARGOS"
         label.fontSize = 64
@@ -144,6 +180,7 @@ class OverlayWindow: NSWindow {
         label.alignmentMode = .center
         label.frame = CGRect(x: width / 2 - 160, y: height / 2 - 40, width: 320, height: 80)
         layer.addSublayer(label)
+        return label
     }
 
     private func makeCrosshair(centre: CGPoint) -> CAShapeLayer {
@@ -164,23 +201,20 @@ class OverlayWindow: NSWindow {
 }
 
 // ── HideBarView ───────────────────────────────────────────────────────────────
-// Thin interactive strip across the top of the overlay.
-// Clicking it hides the overlay — escape hatch when the display is covered.
 
 private class HideBarView: NSView {
 
     var onHide: (() -> Void)?
+    private let label = CATextLayer()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        // Barely visible — just a subtle indicator the bar is there
-        layer?.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.06)
+        layer?.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.04)
 
-        let label = CATextLayer()
         label.string = "▲ click to hide overlay"
         label.fontSize = 10
-        label.foregroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.3)
+        label.foregroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.25)
         label.alignmentMode = .center
         label.frame = CGRect(x: 0, y: 4, width: frame.width, height: 16)
         layer?.addSublayer(label)
@@ -188,11 +222,15 @@ private class HideBarView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    override func mouseUp(with event: NSEvent) {
-        onHide?()
+    /// In capture mode the label fades out — the bar is still clickable.
+    func setLabelVisible(_ visible: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        label.opacity = visible ? 1 : 0
+        CATransaction.commit()
     }
 
-    // Accept clicks without making the window key
+    override func mouseUp(with event: NSEvent) { onHide?() }
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Screen Recording — required for ScreenCaptureKit (SCStream) -->
+    <key>com.apple.security.screen-capture</key>
+    <true/>
+    <!-- No App Sandbox — menu bar accessory app -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+    <!--
+        com.apple.developer.virtual-display requires a provisioning profile
+        from Apple's servers (restricted entitlement). To enable CGVirtualDisplay:
+        1. Create App ID "com.grahamveitch.argos" at developer.apple.com
+        2. Request the virtual-display capability via Apple Developer Relations
+        3. Download the provisioning profile and install it
+        4. Re-add this entitlement and sign with that profile
+    -->
+</dict>
+</plist>
