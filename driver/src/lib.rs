@@ -2,14 +2,19 @@
 ///
 /// Rust library that reads IMU data from Xreal Air 2 Pro over USB HID
 /// and exposes a C-compatible FFI for the Swift macOS app.
+///
+/// Uses ar-drivers-rs (nreal feature) for device communication,
+/// and a complementary filter for stable orientation output.
 
+use ar_drivers::{any_glasses, ARGlasses, GlassesEvent};
+use nalgebra::Vector3;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 // ── Types exposed to Swift via FFI ───────────────────────────────────────────
 
 /// Orientation in radians: pitch (up/down), yaw (left/right), roll (tilt).
-/// Computed from gyroscope + accelerometer fusion.
 #[repr(C)]
 pub struct ArgosOrientation {
     pub pitch: f64,
@@ -18,7 +23,6 @@ pub struct ArgosOrientation {
     pub timestamp_ns: u64,
 }
 
-/// Device connection state returned to Swift.
 #[repr(C)]
 pub enum ArgosStatus {
     Ok = 0,
@@ -27,8 +31,10 @@ pub enum ArgosStatus {
     ReadError = 3,
 }
 
-/// Opaque handle passed back to Swift — owns the device connection.
+/// Owns the glasses connection and sensor fusion state.
 pub struct ArgosSession {
+    glasses: Box<dyn ARGlasses>,
+    fusion: ComplementaryFilter,
     running: Arc<AtomicBool>,
 }
 
@@ -38,17 +44,25 @@ pub struct ArgosSession {
 /// Returns null on failure. Caller must free with `argos_disconnect`.
 #[no_mangle]
 pub extern "C" fn argos_connect() -> *mut ArgosSession {
-    match open_device() {
-        Ok(session) => Box::into_raw(Box::new(session)),
+    match any_glasses() {
+        Ok(glasses) => {
+            let session = ArgosSession {
+                glasses,
+                fusion: ComplementaryFilter::new(),
+                running: Arc::new(AtomicBool::new(true)),
+            };
+            eprintln!("[argos] connected");
+            Box::into_raw(Box::new(session))
+        }
         Err(e) => {
-            eprintln!("[argos-driver] connect failed: {e}");
+            eprintln!("[argos] connect failed: {e}");
             std::ptr::null_mut()
         }
     }
 }
 
-/// Read a single orientation sample. Returns ArgosStatus::Ok on success.
-/// `out` must point to a valid ArgosOrientation.
+/// Block until the next orientation sample is ready.
+/// Returns ArgosStatus::Ok on success; `out` is written only on success.
 #[no_mangle]
 pub extern "C" fn argos_read_orientation(
     session: *mut ArgosSession,
@@ -57,14 +71,21 @@ pub extern "C" fn argos_read_orientation(
     if session.is_null() || out.is_null() {
         return ArgosStatus::ReadError;
     }
-    let _session = unsafe { &*session };
+    let session = unsafe { &mut *session };
 
-    match read_imu_sample() {
-        Ok(orientation) => {
-            unsafe { *out = orientation };
-            ArgosStatus::Ok
+    loop {
+        match session.glasses.read_event() {
+            Ok(GlassesEvent::AccGyro { accelerometer, gyroscope, timestamp }) => {
+                let orientation = session.fusion.update(accelerometer, gyroscope, timestamp);
+                unsafe { *out = orientation };
+                return ArgosStatus::Ok;
+            }
+            Ok(_) => continue, // skip non-IMU events (key press, vsync, etc.)
+            Err(e) => {
+                eprintln!("[argos] read error: {e}");
+                return ArgosStatus::ReadError;
+            }
         }
-        Err(_) => ArgosStatus::ReadError,
     }
 }
 
@@ -74,53 +95,160 @@ pub extern "C" fn argos_disconnect(session: *mut ArgosSession) {
     if !session.is_null() {
         let session = unsafe { Box::from_raw(session) };
         session.running.store(false, Ordering::SeqCst);
+        eprintln!("[argos] disconnected");
     }
 }
 
-/// Returns 1 if an Xreal Air 2 Pro is connected, 0 otherwise.
+/// Returns 1 if an Xreal / Nreal device is detected on USB, 0 otherwise.
 #[no_mangle]
 pub extern "C" fn argos_device_present() -> i32 {
-    match find_xreal_device() {
-        Some(_) => 1,
-        None => 0,
+    let api = match hidapi::HidApi::new() {
+        Ok(a) => a,
+        Err(_) => return 0,
+    };
+    let found = api
+        .device_list()
+        .any(|d| d.vendor_id() == XREAL_VID && d.product_id() == XREAL_AIR2_PRO_PID);
+    if found { 1 } else { 0 }
+}
+
+// ── USB identifiers ───────────────────────────────────────────────────────────
+
+const XREAL_VID: u16 = 0x3318;
+const XREAL_AIR2_PRO_PID: u16 = 0x0432;
+
+// ── Complementary filter ──────────────────────────────────────────────────────
+//
+// Blends gyroscope integration (high-freq, drifts) with accelerometer
+// tilt estimate (low-freq, noisy). Alpha controls the blend:
+//   α close to 1.0 → trust gyro more → smoother but slower to correct drift
+//   α close to 0.0 → trust accel more → jittery but drift-free
+//
+// 0.96 is a good starting point; exposed to Swift as a tunable setting.
+
+const DEFAULT_ALPHA: f64 = 0.96;
+
+struct ComplementaryFilter {
+    pitch: f64,
+    yaw: f64,
+    roll: f64,
+    last_timestamp_us: Option<u64>,
+    alpha: f64,
+    wall_start: Instant,
+}
+
+impl ComplementaryFilter {
+    fn new() -> Self {
+        Self {
+            pitch: 0.0,
+            yaw: 0.0,
+            roll: 0.0,
+            last_timestamp_us: None,
+            alpha: DEFAULT_ALPHA,
+            wall_start: Instant::now(),
+        }
+    }
+
+    fn update(
+        &mut self,
+        accel: Vector3<f32>,
+        gyro: Vector3<f32>,
+        timestamp_us: u64,
+    ) -> ArgosOrientation {
+        // dt in seconds from device timestamps (microseconds)
+        let dt = match self.last_timestamp_us {
+            Some(prev) => (timestamp_us.saturating_sub(prev)) as f64 / 1_000_000.0,
+            None => 0.0,
+        };
+        self.last_timestamp_us = Some(timestamp_us);
+
+        // Gyro integration (rad/s → radians)
+        // Coordinate system: RUB (Right, Up, Backwards) per ar-drivers-rs
+        // gyro.x = pitch rate, gyro.y = yaw rate, gyro.z = roll rate
+        let gyro_pitch = self.pitch + gyro.x as f64 * dt;
+        let gyro_yaw   = self.yaw   + gyro.y as f64 * dt;
+        let gyro_roll  = self.roll  + gyro.z as f64 * dt;
+
+        // Accelerometer tilt estimate (only valid when not accelerating)
+        let accel_pitch = (accel.x as f64).atan2(
+            (accel.y as f64 * accel.y as f64 + accel.z as f64 * accel.z as f64).sqrt()
+        );
+        let accel_roll = (accel.y as f64).atan2(accel.z as f64);
+        // Accel can't estimate yaw — leave gyro-integrated value in place
+
+        // Blend
+        let alpha = self.alpha;
+        self.pitch = alpha * gyro_pitch + (1.0 - alpha) * accel_pitch;
+        self.yaw   = gyro_yaw; // no accel correction for yaw
+        self.roll  = alpha * gyro_roll  + (1.0 - alpha) * accel_roll;
+
+        let timestamp_ns = self.wall_start.elapsed().as_nanos() as u64;
+
+        ArgosOrientation {
+            pitch: self.pitch,
+            yaw:   self.yaw,
+            roll:  self.roll,
+            timestamp_ns,
+        }
     }
 }
 
-// ── Internal implementation ───────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
-// Xreal Air 2 Pro USB identifiers
-const XREAL_VID: u16 = 0x3318;
-const XREAL_AIR2_PRO_PID: u16 = 0x0424;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-// IMU HID interface — interface 3, endpoint 0x89
-const IMU_INTERFACE: i32 = 3;
+    #[test]
+    fn test_device_detection() {
+        let api = hidapi::HidApi::new().expect("hidapi init failed");
+        let found = api
+            .device_list()
+            .any(|d| d.vendor_id() == XREAL_VID && d.product_id() == XREAL_AIR2_PRO_PID);
+        println!(
+            "Xreal Air 2 Pro present: {}",
+            if found { "YES ✓" } else { "NO — plug in glasses" }
+        );
+        assert!(found, "Expected device VID={:#06x} PID={:#06x}", XREAL_VID, XREAL_AIR2_PRO_PID);
+    }
 
-fn find_xreal_device() -> Option<hidapi::DeviceInfo> {
-    let api = hidapi::HidApi::new().ok()?;
-    api.device_list()
-        .find(|d| d.vendor_id() == XREAL_VID && d.product_id() == XREAL_AIR2_PRO_PID)
-        .cloned()
-}
+    #[test]
+    fn test_connect_read_disconnect() {
+        let session = argos_connect();
+        if session.is_null() {
+            println!("No device — skipping");
+            return;
+        }
+        println!("Connected ✓");
 
-fn open_device() -> Result<ArgosSession, Box<dyn std::error::Error>> {
-    let _info = find_xreal_device().ok_or("Xreal Air 2 Pro not found")?;
-    Ok(ArgosSession {
-        running: Arc::new(AtomicBool::new(true)),
-    })
-}
+        // Read 20 IMU samples and print them
+        for i in 0..20 {
+            let mut out = ArgosOrientation { pitch: 0.0, yaw: 0.0, roll: 0.0, timestamp_ns: 0 };
+            let status = argos_read_orientation(session, &mut out);
+            match status {
+                ArgosStatus::Ok => println!(
+                    "  [{i:02}] pitch={:.4}  yaw={:.4}  roll={:.4}  t={}ns",
+                    out.pitch, out.yaw, out.roll, out.timestamp_ns
+                ),
+                _ => println!("  [{i:02}] read error"),
+            }
+        }
 
-/// Placeholder — real implementation reads 64-byte HID packets from interface 3.
-/// Packet layout (from Void Computing reverse engineering):
-///   [0..3]   header (0xFD + CRC32)
-///   [4..7]   timestamp (nanoseconds, little-endian)
-///   [8..13]  gyroscope  xyz (3 × i16, little-endian, scaled)
-///   [14..19] accel      xyz (3 × i16, little-endian, scaled)
-fn read_imu_sample() -> Result<ArgosOrientation, Box<dyn std::error::Error>> {
-    // TODO: replace with real HID read + complementary filter
-    Ok(ArgosOrientation {
-        pitch: 0.0,
-        yaw: 0.0,
-        roll: 0.0,
-        timestamp_ns: 0,
-    })
+        argos_disconnect(session);
+        println!("Disconnected ✓");
+    }
+
+    #[test]
+    fn test_list_all_hid_devices() {
+        let api = hidapi::HidApi::new().expect("hidapi init failed");
+        println!("\n── Connected HID devices ──");
+        for d in api.device_list() {
+            println!(
+                "  VID={:#06x}  PID={:#06x}  manufacturer={:?}  product={:?}",
+                d.vendor_id(), d.product_id(),
+                d.manufacturer_string(), d.product_string(),
+            );
+        }
+        println!("──────────────────────────");
+    }
 }

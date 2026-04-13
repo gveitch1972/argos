@@ -10,7 +10,7 @@ crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
 # AR glasses driver — supports Xreal Air 2 Pro
-ar-drivers = { git = "https://github.com/badicsalex/ar-drivers-rs", features = [] }
+ar-drivers = { git = "https://github.com/badicsalex/ar-drivers-rs", features = ["nreal"] }
 
 # USB HID access
 hidapi = "2.6"
