@@ -19,6 +19,9 @@ let package = Package(
             name: "Argos",
             dependencies: ["ArgosDriver"],
             path: "Sources/Argos",
+            swiftSettings: [
+                .unsafeFlags(["-framework", "ScreenCaptureKit"])
+            ],
             linkerSettings: [
                 .unsafeFlags([
                     "-L", "\(Context.packageDirectory)/driver/target/release",

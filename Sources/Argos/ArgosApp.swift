@@ -16,6 +16,7 @@ struct ArgosApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
 
     let glassesManager = GlassesManager()
+    let captureManager = ScreenCaptureManager()
 
     private var statusItem: NSStatusItem?
     private var overlayWindow: OverlayWindow?
@@ -48,8 +49,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
+        // Global Cmd+Q — works even when overlay covers the display
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "q" {
+                NSApp.terminate(nil)
+            }
+            return event
+        }
+
         glassesManager.start()
         tryOpenOverlay()
+        Task { await captureManager.start() }
     }
 
     // ── Overlay ───────────────────────────────────────────────────────────────
@@ -68,6 +78,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         overlayWindow = window
         overlayShowing = true
         updateOverlayMenuItem()
+        // Attach live capture once overlay is open
+        window.attachCaptureLayer(captureManager.displayLayer)
     }
 
     private func closeOverlay() {
