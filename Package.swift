@@ -7,16 +7,25 @@ let package = Package(
         .macOS(.v13)
     ],
     targets: [
+        // C shim — exposes the Rust FFI header to Swift
+        .target(
+            name: "ArgosDriver",
+            path: "Sources/ArgosDriver",
+            publicHeadersPath: "include"
+        ),
+
         // Swift macOS app
         .executableTarget(
             name: "Argos",
+            dependencies: ["ArgosDriver"],
             path: "Sources/Argos",
             linkerSettings: [
-                // Link the compiled Rust driver
-                .unsafeFlags(["-L", "driver/target/release"]),
+                .unsafeFlags([
+                    "-L", "\(Context.packageDirectory)/driver/target/release",
+                ]),
                 .linkedLibrary("argos_driver"),
-                // hidapi dependency (install via: brew install hidapi)
-                .linkedLibrary("hidapi"),
+                .linkedFramework("IOKit"),
+                .linkedFramework("CoreFoundation"),
             ]
         ),
     ]

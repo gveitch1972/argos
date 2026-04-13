@@ -1,63 +1,152 @@
 import SwiftUI
+import AppKit
 
 @main
 struct ArgosApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        // No main window — lives entirely in the menu bar
         Settings {
-            SettingsView()
+            SettingsView(manager: appDelegate.glassesManager)
         }
     }
 }
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
+
+    let glassesManager = GlassesManager()
+
     private var statusItem: NSStatusItem?
-    private var glassesManager = GlassesManager()
+    private var overlayWindow: OverlayWindow?
+    private var overlayShowing = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory) // hide from Dock
+        NSApp.setActivationPolicy(.accessory) // no Dock icon
 
+        // Menu bar icon
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "eye", accessibilityDescription: "Argos")
-            button.action = #selector(toggleMenu)
-            button.target = self
+            button.image = NSImage(systemSymbolName: "eye.circle", accessibilityDescription: "Argos")
+        }
+        statusItem?.menu = buildMenu()
+
+        // Wire GlassesManager callbacks
+        glassesManager.onOffset = { [weak self] offset in
+            self?.overlayWindow?.applyOffset(offset)
+        }
+        glassesManager.onStatus = { [weak self] text in
+            self?.overlayWindow?.setStatus(text)
+            self?.updateMenuBarIcon(connected: text.contains("connected"))
         }
 
-        statusItem?.menu = buildMenu()
+        // Listen for display changes (user plugs/unplugs glasses)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screensChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+
         glassesManager.start()
+        tryOpenOverlay()
     }
 
-    func buildMenu() -> NSMenu {
+    // ── Overlay ───────────────────────────────────────────────────────────────
+
+    private func tryOpenOverlay() {
+        guard let screen = DisplayFinder.xrealScreen() ?? DisplayFinder.externalScreens().first else {
+            return
+        }
+        openOverlay(on: screen)
+    }
+
+    private func openOverlay(on screen: NSScreen) {
+        overlayWindow?.close()
+        let window = OverlayWindow(screen: screen)
+        window.makeKeyAndOrderFront(nil)
+        overlayWindow = window
+        overlayShowing = true
+        updateOverlayMenuItem()
+    }
+
+    private func closeOverlay() {
+        overlayWindow?.close()
+        overlayWindow = nil
+        overlayShowing = false
+        updateOverlayMenuItem()
+    }
+
+    // ── Menu ──────────────────────────────────────────────────────────────────
+
+    private func buildMenu() -> NSMenu {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Argos — Xreal Air 2 Pro", action: nil, keyEquivalent: ""))
+
+        let title = NSMenuItem(title: "Argos", action: nil, keyEquivalent: "")
+        title.isEnabled = false
+        menu.addItem(title)
         menu.addItem(.separator())
 
-        let statusItem = NSMenuItem(title: "Searching for glasses…", action: nil, keyEquivalent: "")
-        statusItem.tag = 100
-        menu.addItem(statusItem)
+        let toggleItem = NSMenuItem(
+            title: "Show overlay on glasses",
+            action: #selector(toggleOverlay),
+            keyEquivalent: "o"
+        )
+        toggleItem.tag = 10
+        toggleItem.target = self
+        menu.addItem(toggleItem)
 
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Lock screen position", action: #selector(lockPosition), keyEquivalent: "l"))
-        menu.addItem(NSMenuItem(title: "Reset orientation", action: #selector(resetOrientation), keyEquivalent: "r"))
+
+        let lockItem = NSMenuItem(title: "Lock screen position", action: #selector(lock), keyEquivalent: "l")
+        lockItem.target = self
+        menu.addItem(lockItem)
+
+        let resetItem = NSMenuItem(title: "Reset orientation", action: #selector(reset), keyEquivalent: "r")
+        resetItem.target = self
+        menu.addItem(resetItem)
+
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
-        menu.addItem(NSMenuItem(title: "Quit Argos", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        menu.addItem(NSMenuItem(
+            title: "Quit Argos",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        ))
 
         return menu
     }
 
-    @objc func toggleMenu() {}
-
-    @objc func lockPosition() {
-        glassesManager.lockScreenPosition()
+    private func updateOverlayMenuItem() {
+        let title = overlayShowing ? "Hide overlay" : "Show overlay on glasses"
+        statusItem?.menu?.item(withTag: 10)?.title = title
     }
 
-    @objc func resetOrientation() {
-        glassesManager.resetOrientation()
+    private func updateMenuBarIcon(connected: Bool) {
+        let symbol = connected ? "eye.circle.fill" : "eye.circle"
+        statusItem?.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Argos")
+    }
+
+    // ── Actions ───────────────────────────────────────────────────────────────
+
+    @objc func toggleOverlay() {
+        if overlayShowing {
+            closeOverlay()
+        } else {
+            tryOpenOverlay()
+        }
+    }
+
+    @objc func lock() {
+        Task { await glassesManager.lockScreenPosition() }
+    }
+
+    @objc func reset() {
+        Task { await glassesManager.resetOrientation() }
     }
 
     @objc func openSettings() {
@@ -65,9 +154,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    func updateStatus(_ text: String) {
-        DispatchQueue.main.async {
-            self.statusItem?.menu?.item(withTag: 100)?.title = text
+    @objc func screensChanged() {
+        if overlayShowing {
+            tryOpenOverlay() // re-open on correct screen if displays changed
         }
     }
 }

@@ -1,108 +1,106 @@
 import Foundation
-import Combine
+import CoreGraphics
+import ArgosDriver
 
-/// Manages the connection to Xreal Air 2 Pro and publishes orientation updates.
+/// Manages the USB connection to Xreal Air 2 Pro.
+/// Runs a blocking IMU read loop on a background thread and
+/// publishes orientation + display offsets on the main thread.
+@MainActor
 class GlassesManager: ObservableObject {
 
     @Published var isConnected: Bool = false
-    @Published var orientation: Orientation = .zero
-    @Published var isLocked: Bool = false
+    @Published var pitch: Double = 0
+    @Published var yaw: Double = 0
+    @Published var roll: Double = 0
 
-    private var session: OpaquePointer? // ArgosSession*
+    var onOffset: ((CGPoint) -> Void)?   // called ~500Hz with display offset
+    var onStatus: ((String) -> Void)?    // called when status text changes
+
+    private var anchor = DisplayAnchor()
     private var pollingTask: Task<Void, Never>?
-    private var lockedOrientation: Orientation = .zero
-
-    struct Orientation {
-        var pitch: Double // up / down
-        var yaw: Double   // left / right
-        var roll: Double  // tilt
-
-        static let zero = Orientation(pitch: 0, yaw: 0, roll: 0)
-    }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     func start() {
-        pollingTask = Task {
-            await connectionLoop()
+        pollingTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.connectionLoop()
         }
     }
 
     func stop() {
         pollingTask?.cancel()
-        disconnect()
     }
 
     // ── Actions ───────────────────────────────────────────────────────────────
 
     func lockScreenPosition() {
-        lockedOrientation = orientation
-        isLocked = true
+        anchor.lock(pitch: pitch, yaw: yaw)
+        onStatus?("Argos — locked  pitch=\(fmt(pitch))  yaw=\(fmt(yaw))")
     }
 
     func resetOrientation() {
-        isLocked = false
-        lockedOrientation = .zero
+        anchor.unlock()
+        anchor.reset()
+        onStatus?("Argos — tracking")
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
     private func connectionLoop() async {
         while !Task.isCancelled {
-            if argos_device_present() == 1 {
-                await connect()
+            let present = argos_device_present()
+            if present == 1 {
+                await readLoop()
             } else {
-                await MainActor.run { isConnected = false }
+                await MainActor.run {
+                    self.isConnected = false
+                    self.onStatus?("Argos — no glasses found")
+                }
                 try? await Task.sleep(for: .seconds(2))
             }
         }
     }
 
-    private func connect() async {
-        session = OpaquePointer(argos_connect())
+    private func readLoop() async {
+        // argos_connect() and argos_read_orientation() are blocking C calls
+        // — must run off the main thread
+        let session = argos_connect()
         guard session != nil else {
             try? await Task.sleep(for: .seconds(2))
             return
         }
 
-        await MainActor.run { isConnected = true }
+        await MainActor.run {
+            self.isConnected = true
+            self.onStatus?("Argos — connected")
+        }
 
-        // Poll IMU at ~60 Hz
+        // Spin reading samples — argos_read_orientation blocks until data arrives
         while !Task.isCancelled && argos_device_present() == 1 {
             var sample = ArgosOrientation(pitch: 0, yaw: 0, roll: 0, timestamp_ns: 0)
             let status = argos_read_orientation(session, &sample)
 
-            if status == ArgosStatus(rawValue: 0) { // .Ok
-                let o = Orientation(pitch: sample.pitch, yaw: sample.yaw, roll: sample.roll)
-                await MainActor.run { orientation = o }
-                applyToDisplay(o)
+            guard status == ARGOS_OK else { break }
+
+            // Compute display offset (can stay off main thread)
+            let offset = anchor.offset(pitch: sample.pitch, yaw: sample.yaw)
+
+            await MainActor.run {
+                self.pitch = sample.pitch
+                self.yaw   = sample.yaw
+                self.roll  = sample.roll
+                self.onOffset?(offset)
             }
-
-            try? await Task.sleep(for: .milliseconds(16)) // ~60 Hz
         }
 
-        disconnect()
-    }
-
-    private func disconnect() {
-        if let s = session {
-            argos_disconnect(UnsafeMutablePointer(s))
-            session = nil
+        argos_disconnect(session)
+        await MainActor.run {
+            self.isConnected = false
+            self.onStatus?("Argos — disconnected")
         }
-        Task { await MainActor.run { isConnected = false } }
     }
 
-    /// Translate head orientation into display position offset.
-    /// This is the core of the "stable screen" experience.
-    private func applyToDisplay(_ o: Orientation) {
-        guard isConnected else { return }
-
-        let base = isLocked ? lockedOrientation : .zero
-        let _ = o.yaw - base.yaw     // horizontal offset
-        let _ = o.pitch - base.pitch // vertical offset
-
-        // TODO: use CoreGraphics / CGDisplaySetSmoothDisplayMode or
-        //       a virtual display layer to shift screen position
-        // Smoothing: apply exponential moving average to avoid jitter
+    private func fmt(_ v: Double) -> String {
+        String(format: "%.3f", v)
     }
 }
