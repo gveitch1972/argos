@@ -12,8 +12,10 @@ class OverlayWindow: NSWindow {
     private let statusLabel = CATextLayer()
     private let crosshair = CAShapeLayer()
     private var captureLayer: AVSampleBufferDisplayLayer?
-
     private var screenSize: CGSize = .zero
+
+    /// Called when user clicks the top hide-bar.
+    var onHideRequested: (() -> Void)?
 
     // ── Init ──────────────────────────────────────────────────────────────────
 
@@ -28,7 +30,7 @@ class OverlayWindow: NSWindow {
         self.isOpaque = false
         self.backgroundColor = .clear
         self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        self.ignoresMouseEvents = true
+        self.ignoresMouseEvents = false  // we handle clicks in the hide-bar only
         self.isMovable = false
 
         screenSize = screen.frame.size
@@ -105,8 +107,13 @@ class OverlayWindow: NSWindow {
         let ch = makeCrosshair(centre: CGPoint(x: bounds.width / 2, y: bounds.height / 2))
         root.addSublayer(ch)
 
-        // Status — fixed top-left
-        statusLabel.frame = CGRect(x: 16, y: bounds.height - 32, width: 700, height: 20)
+        // Clickable hide-bar — 28px strip across the full top edge
+        let hideBar = HideBarView(frame: CGRect(x: 0, y: bounds.height - 28, width: bounds.width, height: 28))
+        hideBar.onHide = { [weak self] in self?.onHideRequested?() }
+        view.addSubview(hideBar)
+
+        // Status — fixed top-left (sits inside the hide-bar area)
+        statusLabel.frame = CGRect(x: 16, y: bounds.height - 26, width: 700, height: 20)
         statusLabel.fontSize = 12
         statusLabel.foregroundColor = CGColor(red: 0.3, green: 1.0, blue: 0.3, alpha: 0.9)
         statusLabel.string = "Argos — starting…"
@@ -154,4 +161,38 @@ class OverlayWindow: NSWindow {
         layer.fillColor = .clear
         return layer
     }
+}
+
+// ── HideBarView ───────────────────────────────────────────────────────────────
+// Thin interactive strip across the top of the overlay.
+// Clicking it hides the overlay — escape hatch when the display is covered.
+
+private class HideBarView: NSView {
+
+    var onHide: (() -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        // Barely visible — just a subtle indicator the bar is there
+        layer?.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.06)
+
+        let label = CATextLayer()
+        label.string = "▲ click to hide overlay"
+        label.fontSize = 10
+        label.foregroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.3)
+        label.alignmentMode = .center
+        label.frame = CGRect(x: 0, y: 4, width: frame.width, height: 16)
+        layer?.addSublayer(label)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseUp(with event: NSEvent) {
+        onHide?()
+    }
+
+    // Accept clicks without making the window key
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }

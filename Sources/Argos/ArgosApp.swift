@@ -21,18 +21,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var overlayWindow: OverlayWindow?
     private var overlayShowing = false
+    private var captureActive = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory) // no Dock icon
+        NSApp.setActivationPolicy(.accessory)
 
-        // Menu bar icon
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem?.button {
             button.image = NSImage(systemSymbolName: "eye.circle", accessibilityDescription: "Argos")
         }
         statusItem?.menu = buildMenu()
 
-        // Wire GlassesManager callbacks
         glassesManager.onOffset = { [weak self] offset in
             self?.overlayWindow?.applyOffset(offset)
         }
@@ -41,7 +40,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.updateMenuBarIcon(connected: text.contains("connected"))
         }
 
-        // Listen for display changes (user plugs/unplugs glasses)
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screensChanged),
@@ -49,17 +47,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
-        // Global Cmd+Q — works even when overlay covers the display
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "q" {
+        // Cmd+Q only — global monitor just observes, cannot consume,
+        // but terminate() works fine as a side effect.
+        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
+            if event.modifierFlags.contains(.command),
+               event.charactersIgnoringModifiers == "q" {
                 NSApp.terminate(nil)
             }
-            return event
         }
 
         glassesManager.start()
-        tryOpenOverlay()
-        Task { await captureManager.start() }
+        // Overlay and capture are both OFF at startup — open manually via menu
+        // so you can always see and interact with your Mac display first
     }
 
     // ── Overlay ───────────────────────────────────────────────────────────────
@@ -72,20 +71,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func openOverlay(on screen: NSScreen) {
-        overlayWindow?.close()
+        // Re-use existing window if screen hasn't changed — never close() it
+        if let existing = overlayWindow, existing.screen == screen {
+            existing.orderFrontRegardless()
+            overlayShowing = true
+            updateOverlayMenuItem()
+            return
+        }
+
+        // New screen — hide old window first (don't close)
+        overlayWindow?.orderOut(nil)
+
         let window = OverlayWindow(screen: screen)
-        window.makeKeyAndOrderFront(nil)
+        window.onHideRequested = { [weak self] in self?.closeOverlay() }
+        window.orderFrontRegardless()
         overlayWindow = window
         overlayShowing = true
+        if captureActive {
+            window.attachCaptureLayer(captureManager.displayLayer)
+        }
         updateOverlayMenuItem()
-        // Attach live capture once overlay is open
-        window.attachCaptureLayer(captureManager.displayLayer)
+        updateCaptureMenuItem()
     }
 
     private func closeOverlay() {
-        overlayWindow?.close()
-        overlayWindow = nil
+        overlayWindow?.orderOut(nil)
         overlayShowing = false
+        // Re-assert accessory policy — SCStream permission UI can flip it to .regular
+        NSApp.setActivationPolicy(.accessory)
         updateOverlayMenuItem()
     }
 
@@ -99,14 +112,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(title)
         menu.addItem(.separator())
 
-        let toggleItem = NSMenuItem(
-            title: "Show overlay on glasses",
-            action: #selector(toggleOverlay),
-            keyEquivalent: "o"
-        )
+        let toggleItem = NSMenuItem(title: "Show overlay on glasses",
+                                    action: #selector(toggleOverlay),
+                                    keyEquivalent: "")
         toggleItem.tag = 10
         toggleItem.target = self
         menu.addItem(toggleItem)
+
+        let captureItem = NSMenuItem(title: "Start screen capture",
+                                     action: #selector(toggleCapture),
+                                     keyEquivalent: "")
+        captureItem.tag = 11
+        captureItem.target = self
+        menu.addItem(captureItem)
 
         menu.addItem(.separator())
 
@@ -124,18 +142,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settingsItem.target = self
         menu.addItem(settingsItem)
 
-        menu.addItem(NSMenuItem(
-            title: "Quit Argos",
-            action: #selector(NSApplication.terminate(_:)),
-            keyEquivalent: "q"
-        ))
-
+        menu.addItem(NSMenuItem(title: "Quit Argos",
+                                action: #selector(NSApplication.terminate(_:)),
+                                keyEquivalent: "q"))
         return menu
     }
 
     private func updateOverlayMenuItem() {
-        let title = overlayShowing ? "Hide overlay" : "Show overlay on glasses"
-        statusItem?.menu?.item(withTag: 10)?.title = title
+        statusItem?.menu?.item(withTag: 10)?.title = overlayShowing ? "Hide overlay (click top bar)" : "Show overlay on glasses"
+    }
+
+    private func updateCaptureMenuItem() {
+        statusItem?.menu?.item(withTag: 11)?.title = captureActive ? "Stop screen capture" : "Start screen capture"
     }
 
     private func updateMenuBarIcon(connected: Bool) {
@@ -146,20 +164,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // ── Actions ───────────────────────────────────────────────────────────────
 
     @objc func toggleOverlay() {
-        if overlayShowing {
-            closeOverlay()
+        if overlayShowing { closeOverlay() } else { tryOpenOverlay() }
+    }
+
+    @objc func toggleCapture() {
+        if captureActive {
+            captureManager.stop()
+            captureActive = false
         } else {
-            tryOpenOverlay()
+            captureActive = true
+            Task {
+                await captureManager.start()
+                overlayWindow?.attachCaptureLayer(captureManager.displayLayer)
+            }
         }
+        updateCaptureMenuItem()
     }
 
-    @objc func lock() {
-        Task { await glassesManager.lockScreenPosition() }
-    }
-
-    @objc func reset() {
-        Task { await glassesManager.resetOrientation() }
-    }
+    @objc func lock()  { Task { await glassesManager.lockScreenPosition() } }
+    @objc func reset() { Task { await glassesManager.resetOrientation() } }
 
     @objc func openSettings() {
         NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
@@ -167,8 +190,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func screensChanged() {
-        if overlayShowing {
-            tryOpenOverlay() // re-open on correct screen if displays changed
-        }
+        if overlayShowing { tryOpenOverlay() }
     }
+
+    // Prevent app from quitting when last window closes
+    func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
+
+    // Prevent app from hiding when it loses focus
+    func applicationShouldHandleReopen(_ app: NSApplication, hasVisibleWindows: Bool) -> Bool { true }
 }
