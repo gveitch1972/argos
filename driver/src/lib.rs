@@ -163,23 +163,32 @@ impl ComplementaryFilter {
         self.last_timestamp_us = Some(timestamp_us);
 
         // Gyro integration (rad/s → radians)
-        // Coordinate system: RUB (Right, Up, Backwards) per ar-drivers-rs
-        // gyro.x = pitch rate, gyro.y = yaw rate, gyro.z = roll rate
-        let gyro_pitch = self.pitch + gyro.x as f64 * dt;
+        //
+        // nreal_air driver remaps raw axes before emitting GlassesEvent:
+        //   raw_x → gyro.x (negated) — physical side-tilt (roll)
+        //   raw_y → gyro.z           — physical nod up/down (pitch)
+        //   raw_z → gyro.y           — physical turn left/right (yaw)
+        //
+        // So the correct mapping when worn as glasses is:
+        //   yaw   = gyro.y  (left/right head turn)
+        //   pitch = gyro.z  (nod up/down)
+        //   roll  = gyro.x  (side tilt)
+        let gyro_pitch = self.pitch + gyro.z as f64 * dt;
         let gyro_yaw   = self.yaw   + gyro.y as f64 * dt;
-        let gyro_roll  = self.roll  + gyro.z as f64 * dt;
+        let gyro_roll  = self.roll  + gyro.x as f64 * dt;
 
-        // Accelerometer tilt estimate (only valid when not accelerating)
-        let accel_pitch = (accel.x as f64).atan2(
-            (accel.y as f64 * accel.y as f64 + accel.z as f64 * accel.z as f64).sqrt()
-        );
-        let accel_roll = (accel.y as f64).atan2(accel.z as f64);
-        // Accel can't estimate yaw — leave gyro-integrated value in place
+        // Accelerometer tilt estimate (only valid when not accelerating).
+        // In RUB at rest: accel ≈ (0, +9.81, 0)
+        // Pitch (nod): angle of forward tilt = atan2(-accel.z, accel.y)
+        // Roll  (tilt): angle of side tilt   = atan2( accel.x, accel.y)
+        let accel_pitch = (-(accel.z as f64)).atan2(accel.y as f64);
+        let accel_roll  = (  accel.x as f64 ).atan2(accel.y as f64);
+        // Accel can't estimate yaw — gyro-only
 
         // Blend
         let alpha = self.alpha;
         self.pitch = alpha * gyro_pitch + (1.0 - alpha) * accel_pitch;
-        self.yaw   = gyro_yaw; // no accel correction for yaw
+        self.yaw   = gyro_yaw;
         self.roll  = alpha * gyro_roll  + (1.0 - alpha) * accel_roll;
 
         let timestamp_ns = self.wall_start.elapsed().as_nanos() as u64;

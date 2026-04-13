@@ -13,8 +13,11 @@ struct DisplayAnchor {
     // ── Configuration ─────────────────────────────────────────────────────────
 
     /// Pixels of travel per radian of head rotation.
-    /// At 1.0 rad (57°) the display shifts by this many pixels.
-    var pixelsPerRadian: Double = 800.0
+    /// Calibrated to the Air 2 Pro's 46° FOV: small stabilising movements only.
+    var pixelsPerRadian: Double = 450.0
+
+    /// Maximum pixel offset in any direction — keeps content on screen.
+    var maxOffset: Double = 180.0
 
     /// Movements smaller than this (radians) are ignored — prevents micro-jitter.
     var deadZone: Double = 0.005
@@ -68,7 +71,11 @@ struct DisplayAnchor {
         smoothedX = α * smoothedX + (1 - α) * targetX
         smoothedY = α * smoothedY + (1 - α) * targetY
 
-        return CGPoint(x: smoothedX, y: smoothedY)
+        // Clamp — keep content visible, don't allow full wrap-around
+        let cx = max(-maxOffset, min(maxOffset, smoothedX))
+        let cy = max(-maxOffset, min(maxOffset, smoothedY))
+
+        return CGPoint(x: cx, y: cy)
     }
 
     mutating func reset() {

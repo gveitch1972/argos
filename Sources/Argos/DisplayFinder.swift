@@ -18,7 +18,9 @@ struct DisplayFinder {
 
     private static func isXrealDisplay(_ screen: NSScreen) -> Bool {
         let name = screen.localizedName.lowercased()
-        return name.contains("xreal") || name.contains("nreal") || name.contains("air")
+        // "Air 2 Pro" is how macOS names the Xreal Air 2 Pro display
+        return name.contains("xreal") || name.contains("nreal")
+            || name.contains("air 2") || name.contains("air2")
     }
 }
 

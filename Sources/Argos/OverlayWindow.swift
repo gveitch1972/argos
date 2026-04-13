@@ -2,17 +2,15 @@ import AppKit
 import SwiftUI
 
 /// Full-screen borderless window that sits on the Xreal display.
-/// Pans its content layer opposite to head movement — making the
-/// virtual display feel pinned in space.
+///
+/// The panLayer is 3× the screen size — the window clips it, acting as a
+/// viewport into a larger canvas. Moving the panLayer pans the view without
+/// revealing the background.
 class OverlayWindow: NSWindow {
 
-    private let contentLayer = CALayer()
-    private let panLayer = CALayer()       // child layer that actually moves
+    private var panLayer = CALayer()       // oversized canvas — this moves
     private let statusLabel = CATextLayer()
-    private let crosshair = CAShapeLayer() // centre reference point
-
-    // Published so the menu bar can reflect connection state
-    var onOrientationUpdate: ((Double, Double, Double) -> Void)?
+    private let crosshair = CAShapeLayer() // stays fixed at screen centre
 
     // ── Init ──────────────────────────────────────────────────────────────────
 
@@ -31,23 +29,24 @@ class OverlayWindow: NSWindow {
         self.ignoresMouseEvents = true
         self.isMovable = false
 
-        setupLayers(frame: screen.frame)
+        setupLayers(screenBounds: screen.frame)
     }
 
     // ── Public ────────────────────────────────────────────────────────────────
 
-    /// Apply a pan offset (points) to the content layer — call from GlassesManager.
+    /// Shift the canvas by `offset` points to simulate a fixed display in space.
+    /// Call from GlassesManager at ~60 Hz.
     func applyOffset(_ offset: CGPoint) {
+        guard let root = contentView?.layer else { return }
         CATransaction.begin()
-        CATransaction.setDisableActions(true) // no implicit animation
+        CATransaction.setDisableActions(true)
         panLayer.position = CGPoint(
-            x: contentLayer.bounds.midX + offset.x,
-            y: contentLayer.bounds.midY + offset.y
+            x: root.bounds.midX + offset.x,
+            y: root.bounds.midY + offset.y
         )
         CATransaction.commit()
     }
 
-    /// Update the status overlay text.
     func setStatus(_ text: String) {
         DispatchQueue.main.async {
             CATransaction.begin()
@@ -59,83 +58,101 @@ class OverlayWindow: NSWindow {
 
     // ── Private ───────────────────────────────────────────────────────────────
 
-    private func setupLayers(frame: NSRect) {
-        let view = NSView(frame: frame)
+    private func setupLayers(screenBounds: NSRect) {
+        let view = NSView(frame: screenBounds)
         view.wantsLayer = true
+        view.layer?.masksToBounds = true  // clips panLayer at screen edges
         contentView = view
         guard let root = view.layer else { return }
 
-        // Root layer — fills the window
-        root.backgroundColor = CGColor(red: 0.05, green: 0.05, blue: 0.05, alpha: 0.85)
+        root.backgroundColor = CGColor(red: 0.05, green: 0.05, blue: 0.08, alpha: 0.92)
 
-        // Pan layer — this is what moves with your head
-        panLayer.frame = root.bounds
+        // PanLayer — 1.5× screen size, initially centred.
+        // The extra margin gives room for stabilisation without wrapping.
+        let pw = screenBounds.width * 1.5
+        let ph = screenBounds.height * 1.5
+        panLayer = CALayer()
+        panLayer.bounds = CGRect(x: 0, y: 0, width: pw, height: ph)
+        panLayer.position = CGPoint(x: root.bounds.midX, y: root.bounds.midY)
         panLayer.backgroundColor = CGColor.clear
         root.addSublayer(panLayer)
 
-        // Grid — visual reference so you can see the panning
-        addGrid(to: panLayer, bounds: root.bounds)
+        addGrid(to: panLayer, width: pw, height: ph)
+        addCentreLabel(to: panLayer, width: pw, height: ph)
 
-        // Crosshair at absolute centre of window (doesn't move)
-        let ch = makeCrosshair(centre: CGPoint(x: frame.midX, y: frame.midY))
+        // Fixed crosshair at exact screen centre — does NOT move
+        let ch = makeCrosshair(centre: CGPoint(x: screenBounds.width / 2, y: screenBounds.height / 2))
         root.addSublayer(ch)
 
-        // Status label (top-left, fixed)
-        statusLabel.frame = CGRect(x: 20, y: frame.height - 40, width: 500, height: 24)
-        statusLabel.fontSize = 14
-        statusLabel.foregroundColor = CGColor(red: 0.4, green: 1.0, blue: 0.4, alpha: 1)
-        statusLabel.string = "Argos — connecting…"
-        statusLabel.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        // Status label — fixed top-left
+        statusLabel.frame = CGRect(x: 20, y: screenBounds.height - 36, width: 600, height: 22)
+        statusLabel.fontSize = 13
+        statusLabel.foregroundColor = CGColor(red: 0.4, green: 1.0, blue: 0.4, alpha: 0.9)
+        statusLabel.string = "Argos — starting…"
+        statusLabel.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         root.addSublayer(statusLabel)
     }
 
-    private func addGrid(to layer: CALayer, bounds: CGRect) {
+    private func addGrid(to layer: CALayer, width: CGFloat, height: CGFloat) {
         let grid = CAShapeLayer()
         let path = CGMutablePath()
-        let spacing: CGFloat = 80
+        let spacing: CGFloat = 40   // tighter grid
 
-        var x = bounds.minX.truncatingRemainder(dividingBy: spacing)
-        while x <= bounds.maxX + spacing {
-            path.move(to: CGPoint(x: x, y: bounds.minY - spacing))
-            path.addLine(to: CGPoint(x: x, y: bounds.maxY + spacing))
+        var x: CGFloat = 0
+        while x <= width {
+            path.move(to: CGPoint(x: x, y: 0))
+            path.addLine(to: CGPoint(x: x, y: height))
             x += spacing
         }
-        var y = bounds.minY.truncatingRemainder(dividingBy: spacing)
-        while y <= bounds.maxY + spacing {
-            path.move(to: CGPoint(x: bounds.minX - spacing, y: y))
-            path.addLine(to: CGPoint(x: bounds.maxX + spacing, y: y))
+        var y: CGFloat = 0
+        while y <= height {
+            path.move(to: CGPoint(x: 0, y: y))
+            path.addLine(to: CGPoint(x: width, y: y))
             y += spacing
         }
 
         grid.path = path
-        grid.strokeColor = CGColor(red: 0.2, green: 0.3, blue: 0.4, alpha: 0.5)
+        grid.strokeColor = CGColor(red: 0.15, green: 0.25, blue: 0.4, alpha: 0.6)
         grid.lineWidth = 0.5
         grid.fillColor = .clear
         layer.addSublayer(grid)
+    }
 
-        // Argos label in the centre of the pan layer
+    private func addCentreLabel(to layer: CALayer, width: CGFloat, height: CGFloat) {
         let label = CATextLayer()
         label.string = "ARGOS"
-        label.fontSize = 48
-        label.foregroundColor = CGColor(red: 0.2, green: 0.4, blue: 0.6, alpha: 0.3)
-        label.font = NSFont.systemFont(ofSize: 48, weight: .thin)
-        label.frame = CGRect(x: bounds.midX - 80, y: bounds.midY - 30, width: 160, height: 60)
+        label.fontSize = 64
+        label.foregroundColor = CGColor(red: 0.25, green: 0.45, blue: 0.7, alpha: 0.25)
         label.alignmentMode = .center
+        label.frame = CGRect(x: width / 2 - 160, y: height / 2 - 40, width: 320, height: 80)
         layer.addSublayer(label)
+
+        // Subtle ring at canvas centre
+        let ring = CAShapeLayer()
+        let r: CGFloat = 60
+        ring.path = CGPath(ellipseIn: CGRect(x: width/2 - r, y: height/2 - r, width: r*2, height: r*2), transform: nil)
+        ring.strokeColor = CGColor(red: 0.3, green: 0.5, blue: 0.8, alpha: 0.3)
+        ring.fillColor = .clear
+        ring.lineWidth = 1
+        layer.addSublayer(ring)
     }
 
     private func makeCrosshair(centre: CGPoint) -> CAShapeLayer {
-        let size: CGFloat = 20
+        let size: CGFloat = 16
         let path = CGMutablePath()
         path.move(to: CGPoint(x: centre.x - size, y: centre.y))
         path.addLine(to: CGPoint(x: centre.x + size, y: centre.y))
         path.move(to: CGPoint(x: centre.x, y: centre.y - size))
         path.addLine(to: CGPoint(x: centre.x, y: centre.y + size))
 
+        // Small circle around crosshair centre
+        path.addEllipse(in: CGRect(x: centre.x - 4, y: centre.y - 4, width: 8, height: 8))
+
         let layer = CAShapeLayer()
         layer.path = path
-        layer.strokeColor = CGColor(red: 1, green: 0.3, blue: 0.3, alpha: 0.8)
-        layer.lineWidth = 1.5
+        layer.strokeColor = CGColor(red: 1, green: 0.3, blue: 0.3, alpha: 0.7)
+        layer.lineWidth = 1
+        layer.fillColor = .clear
         return layer
     }
 }

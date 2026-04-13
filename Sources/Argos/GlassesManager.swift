@@ -72,11 +72,29 @@ class GlassesManager: ObservableObject {
 
         await MainActor.run {
             self.isConnected = true
-            self.onStatus?("Argos — connected")
+            self.onStatus?("Argos — calibrating…")
         }
 
-        // Spin reading samples — argos_read_orientation blocks until data arrives
-        while !Task.isCancelled && argos_device_present() == 1 {
+        // Collect 30 frames to establish a stable baseline orientation.
+        // Without this the initial IMU reading immediately pans the display.
+        var calibPitch = 0.0, calibYaw = 0.0
+        let calibFrames = 30
+        for _ in 0..<calibFrames {
+            var s = ArgosOrientation(pitch: 0, yaw: 0, roll: 0, timestamp_ns: 0)
+            guard argos_read_orientation(session, &s) == ARGOS_OK else { break }
+            calibPitch += s.pitch / Double(calibFrames)
+            calibYaw   += s.yaw   / Double(calibFrames)
+        }
+        anchor.lock(pitch: calibPitch, yaw: calibYaw)
+
+        await MainActor.run {
+            self.onStatus?("Argos — connected  (⌘L to re-lock)")
+        }
+
+        // Spin reading samples — argos_read_orientation blocks until data arrives.
+        // Do NOT call argos_device_present() here — once we hold the HID device
+        // exclusively, it won't appear in scans and would immediately exit the loop.
+        while !Task.isCancelled {
             var sample = ArgosOrientation(pitch: 0, yaw: 0, roll: 0, timestamp_ns: 0)
             let status = argos_read_orientation(session, &sample)
 
@@ -90,6 +108,7 @@ class GlassesManager: ObservableObject {
                 self.yaw   = sample.yaw
                 self.roll  = sample.roll
                 self.onOffset?(offset)
+                self.onStatus?("Argos — connected  p:\(self.fmt(sample.pitch))  y:\(self.fmt(sample.yaw))")
             }
         }
 
